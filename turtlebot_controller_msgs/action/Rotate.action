@@ -1,0 +1,12 @@
+# Goal
+float64 angle           # radians, signed. +pi/2 = 90 deg CCW, -pi/2 = 90 deg CW
+float64 angular_speed   # rad/s, positive, clamped to max
+---
+# Result
+float64 angle_turned
+bool    success
+string  message
+---
+# Feedback
+float64 angle_turned
+float64 angle_remaining

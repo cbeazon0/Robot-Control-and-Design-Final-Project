@@ -1,0 +1,13 @@
+# Goal
+float64 distance        # meters. 0 or negative = drive forward until canceled
+float64 speed           # m/s, positive, clamped to max
+---
+# Result
+float64 distance_traveled
+bool    success
+string  message
+---
+# Feedback
+float64 distance_traveled
+float64 distance_remaining
+float64 current_speed

@@ -30,6 +30,7 @@ setup(
             'rotate_cli = turtlebot_controller.cli:rotate_main',
             'stop_cli = turtlebot_controller.cli:stop_main',
             'forward_right_forward = turtlebot_controller.forward_right_forward:main',
+            'yolo_detector = turtlebot_controller.yolo_detector:main',
         ],
     },
 )

@@ -25,7 +25,7 @@ Parameters::
     linear_speed_mps       double   0.0381   forward speed (= 1.5 in/s)
     maneuver_speed_mps     double   0.08     forward speed inside the Stop maneuver
     angular_speed_rps      double   0.6      rotation speed for turns
-    min_confidence         double   0.50     drop YOLO msgs below this
+    min_confidence         double   0.25     drop YOLO msgs below this (match yolo_detector)
     stable_frames          int      3        N consecutive same-class frames
     post_turn_cooldown_s   double   1.5      ignore signs for this long after a turn
     detection_topic        string   '/yolo_detections'
@@ -93,7 +93,7 @@ class SignFollower(Node):
         self.declare_parameter('linear_speed_mps', DEFAULT_LINEAR_SPEED_MPS)
         self.declare_parameter('maneuver_speed_mps', DEFAULT_MANEUVER_SPEED_MPS)
         self.declare_parameter('angular_speed_rps', DEFAULT_ANGULAR_SPEED_RPS)
-        self.declare_parameter('min_confidence', 0.50)
+        self.declare_parameter('min_confidence', 0.25)
         self.declare_parameter('stable_frames', 3)
         self.declare_parameter('post_turn_cooldown_s', 1.5)
         self.declare_parameter('detection_topic', '/yolo_detections')
@@ -152,7 +152,16 @@ class SignFollower(Node):
             return
         cls_name = str(det.get('class', ''))
         conf = float(det.get('conf', 0.0))
-        if conf < self._min_conf or cls_name not in CANON_CLASSES:
+        if conf < self._min_conf:
+            self.get_logger().info(
+                f"drop '{cls_name}' conf={conf:.2f} "
+                f"(below min_confidence={self._min_conf:.2f})"
+            )
+            return
+        if cls_name not in CANON_CLASSES:
+            self.get_logger().info(
+                f"drop class '{cls_name}' (not in {sorted(CANON_CLASSES)})"
+            )
             return
 
         now = time.monotonic()

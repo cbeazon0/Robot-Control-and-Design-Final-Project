@@ -212,6 +212,18 @@ class YoloDetectorNode(Node):
         self.declare_parameter('camera_device', '/dev/video0')
         self.declare_parameter('detect_rate_hz', 5.0)
         self.declare_parameter('min_confidence', 0.25)
+        # Collapse directional variants into canonical class names. Each
+        # entry is "<raw_class_name>=<canonical_class_name>". The '='
+        # separator is safe for class names that contain ':' or spaces.
+        self.declare_parameter(
+            'class_aliases',
+            [
+                'Left Arrow=Turn',
+                'Right Arrow=Turn',
+                'Left Turn=Turn Around',
+                'Right Turn=Turn Around',
+            ],
+        )
 
         weights_path = (
             self.get_parameter('weights_path').get_parameter_value().string_value
@@ -225,6 +237,30 @@ class YoloDetectorNode(Node):
         self._min_conf = (
             self.get_parameter('min_confidence').get_parameter_value().double_value
         )
+
+        raw_aliases = list(
+            self.get_parameter('class_aliases')
+            .get_parameter_value()
+            .string_array_value
+        )
+        self._class_aliases: dict[str, str] = {}
+        for entry in raw_aliases:
+            if '=' not in entry:
+                self.get_logger().warn(
+                    f"Ignoring class_aliases entry '{entry}' "
+                    "(expected '<raw>=<canonical>')."
+                )
+                continue
+            raw, canonical = entry.split('=', 1)
+            raw = raw.strip()
+            canonical = canonical.strip()
+            if not raw or not canonical:
+                continue
+            self._class_aliases[raw] = canonical
+        if self._class_aliases:
+            self.get_logger().info(
+                f"Class aliases active: {self._class_aliases}"
+            )
 
         if not weights_path:
             weights_path = _find_default_weights()
@@ -298,9 +334,10 @@ class YoloDetectorNode(Node):
                 if conf < self._min_conf:
                     continue
                 cls_id = int(boxes.cls[i].item())
-                cls_name = names.get(cls_id, str(cls_id)) if isinstance(
+                raw_cls_name = names.get(cls_id, str(cls_id)) if isinstance(
                     names, dict
                 ) else str(cls_id)
+                cls_name = self._class_aliases.get(raw_cls_name, raw_cls_name)
 
                 # xyxy is (x1, y1, x2, y2) in the processed-frame coordinate
                 # system. Processed frame is the same size as the raw frame
@@ -314,13 +351,16 @@ class YoloDetectorNode(Node):
                 cx = (x1 + x2) * 0.5
                 cy = (y1 + y2) * 0.5
 
+                aliased = cls_name != raw_cls_name
+                alias_hint = f" [raw='{raw_cls_name}']" if aliased else ''
                 self.get_logger().info(
-                    f"Detected '{cls_name}' (conf={conf:.3f}) "
+                    f"Detected '{cls_name}'{alias_hint} (conf={conf:.3f}) "
                     f"bbox=[{bw:.0f}x{bh:.0f}] @ ({cx:.0f},{cy:.0f})"
                 )
 
                 payload = {
                     'class': cls_name,
+                    'raw_class': raw_cls_name,
                     'class_id': cls_id,
                     'conf': round(conf, 4),
                     'cx': round(cx, 1),

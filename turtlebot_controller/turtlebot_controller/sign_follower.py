@@ -27,7 +27,7 @@ Parameters::
     angular_speed_rps      double   0.6      rotation speed for turns
     min_confidence         double   0.25     drop YOLO msgs below this (match yolo_detector)
     stable_frames          int      3        N consecutive same-class frames
-    post_turn_cooldown_s   double   1.5      ignore signs for this long after a turn
+    post_turn_cooldown_s   double   3.0      ignore signs for this long after any motion
     detection_topic        string   '/yolo_detections'
 """
 
@@ -95,7 +95,7 @@ class SignFollower(Node):
         self.declare_parameter('angular_speed_rps', DEFAULT_ANGULAR_SPEED_RPS)
         self.declare_parameter('min_confidence', 0.25)
         self.declare_parameter('stable_frames', 3)
-        self.declare_parameter('post_turn_cooldown_s', 1.5)
+        self.declare_parameter('post_turn_cooldown_s', 3.0)
         self.declare_parameter('detection_topic', '/yolo_detections')
 
         p = self.get_parameter

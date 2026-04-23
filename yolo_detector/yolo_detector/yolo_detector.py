@@ -275,23 +275,49 @@ class YoloDetectorNode(Node):
         self.get_logger().info(f"Loading YOLO weights from '{weights_path}'.")
         self._model = YOLO(weights_path)
 
-        # VideoCapture accepts both a numeric index and a /dev/video* path.
-        source: int | str = self._camera_device
+        # Prefer opening the V4L2 device by path with an explicit V4L2
+        # backend. On systems with many /dev/video* nodes (e.g. Raspberry
+        # Pi, which exposes bcm2835-codec and bcm2835-isp devices), using
+        # a numeric index makes OpenCV probe every node and often lands
+        # on a non-capture device, failing with "Not a video capture
+        # device." Opening by path with CAP_V4L2 avoids that.
+        attempts: list[tuple[object, int, str]] = []
         if self._camera_device.startswith('/dev/video'):
+            attempts.append((self._camera_device, cv2.CAP_V4L2, 'path+V4L2'))
+            attempts.append((self._camera_device, cv2.CAP_ANY, 'path+ANY'))
             try:
-                source = int(self._camera_device.replace('/dev/video', ''))
+                idx = int(self._camera_device.replace('/dev/video', ''))
+                attempts.append((idx, cv2.CAP_V4L2, 'index+V4L2'))
             except ValueError:
-                source = self._camera_device
+                pass
+        else:
+            attempts.append((self._camera_device, cv2.CAP_ANY, 'source+ANY'))
 
-        self.get_logger().info(
-            f"Opening camera '{self._camera_device}' (cv2 source={source})."
-        )
-        self._cap = cv2.VideoCapture(source)
-        if not self._cap.isOpened():
+        self._cap = None
+        last_source = None
+        for source, backend, label in attempts:
+            self.get_logger().info(
+                f"Opening camera '{self._camera_device}' "
+                f"(cv2 source={source!r}, backend={label})."
+            )
+            cap = cv2.VideoCapture(source, backend)
+            if cap.isOpened():
+                self._cap = cap
+                last_source = source
+                break
+            cap.release()
+
+        if self._cap is None or not self._cap.isOpened():
             raise RuntimeError(
                 f"Could not open camera '{self._camera_device}'. "
-                'Check permissions and that the device exists.'
+                "Check that the device exists, that no other process is "
+                "holding it, and that your user is in the 'video' group "
+                "(run `groups` to verify; add with "
+                "`sudo usermod -aG video $USER` then log out/in)."
             )
+        self.get_logger().info(
+            f"Camera opened via source={last_source!r}."
+        )
 
         self._pub = self.create_publisher(String, 'yolo_detections', 10)
 

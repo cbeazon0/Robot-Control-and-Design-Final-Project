@@ -24,6 +24,7 @@ Parameters (all optional):
 
 from __future__ import annotations
 
+import json
 import os
 
 import cv2
@@ -278,6 +279,8 @@ class YoloDetectorNode(Node):
             self.get_logger().error(f'Preprocessing failed: {exc}')
             return
 
+        img_h, img_w = processed.shape[:2]
+
         results = self._model.predict(
             source=processed,
             verbose=False,
@@ -298,11 +301,37 @@ class YoloDetectorNode(Node):
                 cls_name = names.get(cls_id, str(cls_id)) if isinstance(
                     names, dict
                 ) else str(cls_id)
-                self.get_logger().info(
-                    f"Detected '{cls_name}' (conf={conf:.3f})"
+
+                # xyxy is (x1, y1, x2, y2) in the processed-frame coordinate
+                # system. Processed frame is the same size as the raw frame
+                # (preprocess does not resize), so these pixels map 1:1 to
+                # raw camera pixels.
+                x1, y1, x2, y2 = (
+                    float(v.item()) for v in boxes.xyxy[i]
                 )
+                bw = max(0.0, x2 - x1)
+                bh = max(0.0, y2 - y1)
+                cx = (x1 + x2) * 0.5
+                cy = (y1 + y2) * 0.5
+
+                self.get_logger().info(
+                    f"Detected '{cls_name}' (conf={conf:.3f}) "
+                    f"bbox=[{bw:.0f}x{bh:.0f}] @ ({cx:.0f},{cy:.0f})"
+                )
+
+                payload = {
+                    'class': cls_name,
+                    'class_id': cls_id,
+                    'conf': round(conf, 4),
+                    'cx': round(cx, 1),
+                    'cy': round(cy, 1),
+                    'w': round(bw, 1),
+                    'h': round(bh, 1),
+                    'img_w': int(img_w),
+                    'img_h': int(img_h),
+                }
                 msg = String()
-                msg.data = f'{cls_name}:{conf:.3f}'
+                msg.data = json.dumps(payload, separators=(',', ':'))
                 self._pub.publish(msg)
 
     def destroy_node(self) -> bool:

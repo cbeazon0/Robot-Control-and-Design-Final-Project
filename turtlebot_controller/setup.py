@@ -30,6 +30,8 @@ setup(
             'rotate_cli = turtlebot_controller.cli:rotate_main',
             'stop_cli = turtlebot_controller.cli:stop_main',
             'forward_right_forward = turtlebot_controller.forward_right_forward:main',
+            'drive_until_sign = turtlebot_controller.drive_until_sign:main',
+            'calibrate_signs = turtlebot_controller.calibrate_signs:main',
         ],
     },
 )

@@ -152,7 +152,8 @@ class SignFollower(Node):
 
         self.get_logger().info(
             f"sign_follower ready: speed={self._linear_speed:.3f} m/s, "
-            f"trigger_at={self._stop_distance_m:.3f} m, "
+            f"trigger when bbox >= calibration size "
+            f"(calibrated at {self._calib_reference_distance_m:.3f} m), "
             f"classes={sorted(self._calib_signs.keys())}."
         )
 
@@ -237,14 +238,20 @@ class SignFollower(Node):
         ref_size = self._ref_size_for(cls_name)
         if ref_size <= 0.0:
             return
+
+        # Direct bbox comparison: bigger-than-calibration means the sign is
+        # closer than the calibration distance (pinhole geometry). We still
+        # compute an estimated distance for the log, but the trigger is the
+        # pixel-size comparison itself.
         distance_m = self._calib_reference_distance_m * ref_size / size_px
+        trigger_ratio = size_px / ref_size   # >= 1.0 means "at or past" calib
 
         with self._lock:
             state = self._state
 
             # In STOPPED state, we only care about Stop-sign presence.
             if state == S_STOPPED:
-                if cls_name == 'Stop' and distance_m <= self._stop_distance_m:
+                if cls_name == 'Stop' and trigger_ratio >= 1.0:
                     self._last_stop_seen = now
                 return
 
@@ -255,15 +262,13 @@ class SignFollower(Node):
             if now < self._cooldown_until:
                 return
 
-            qualifies = distance_m <= self._stop_distance_m
+            qualifies = trigger_ratio >= 1.0
             if not qualifies:
                 # Reset the stability counter if either the class changes
                 # or the current one moves out of range.
                 if cls_name != self._pending_sign:
                     self._pending_sign = cls_name
-                    self._stable_count = 0
-                else:
-                    self._stable_count = 0
+                self._stable_count = 0
                 return
 
             if cls_name != self._pending_sign:
@@ -275,7 +280,8 @@ class SignFollower(Node):
             self.get_logger().info(
                 f"'{cls_name}' conf={conf:.2f} "
                 f"bbox_{self._size_dimension}={size_px:.0f}px "
-                f"dist={distance_m:.2f} m "
+                f"(ref={ref_size:.0f}px, ratio={trigger_ratio:.2f}, "
+                f"~{distance_m:.2f} m) "
                 f"[{self._stable_count}/{self._stable_needed}]"
             )
 
@@ -469,11 +475,18 @@ def main(args=None) -> None:
     except KeyboardInterrupt:
         node.get_logger().info('Ctrl-C; canceling any active goal...')
         node._cancel_goal()
+        # Give cancel time to propagate before tearing down.
         time.sleep(0.5)
-    finally:
+
+    # Stop rclpy first so the spin thread unwinds cleanly, THEN destroy
+    # the node. Destroying while rclpy.spin is active can segfault rmw.
+    if rclpy.ok():
+        rclpy.shutdown()
+    executor_thread.join(timeout=2.0)
+    try:
         node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+    except Exception:
+        pass
 
     sys.exit(0)
 

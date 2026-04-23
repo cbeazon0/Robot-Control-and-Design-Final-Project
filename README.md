@@ -5,7 +5,7 @@ A ROS2 closed-loop motion controller for a TurtleBot. Exposes two actions,
 
 ## What's in here
 
-Two ROS2 packages:
+Three ROS2 packages:
 
 - `turtlebot_controller_msgs/` (ament_cmake) — defines the `Drive` and
   `Rotate` action interfaces.
@@ -17,6 +17,13 @@ Two ROS2 packages:
     and publishes `geometry_msgs/Twist` on `/cmd_vel`.
   - `drive_cli`, `rotate_cli`, `stop_cli` — convenience command-line
     clients.
+- `yolo_detector/` (ament_python) — standalone perception node:
+  - `yolo_detector` — reads frames from a USB camera
+    (default `/dev/video0`), runs a red/dark-quadrilateral preprocessing
+    pipeline, feeds the result into a YOLO model (`best.pt`), and
+    publishes each detection as a `std_msgs/String` (`"class:conf"`) on
+    `/yolo_detections`. Requires `pip install ultralytics opencv-python
+    scikit-learn numpy`.
 
 The TurtleBot base driver already publishes `/odom`, so this project only
 **consumes** odometry; it does not generate it.
@@ -65,7 +72,7 @@ under `src/`):
 
 ```bash
 cd ~/ros2_ws
-colcon build --packages-select turtlebot_controller_msgs turtlebot_controller
+colcon build --packages-select turtlebot_controller_msgs turtlebot_controller yolo_detector
 source install/setup.bash
 ```
 
@@ -129,6 +136,18 @@ ros2 run turtlebot_controller rotate_cli -90
 # Cancel any active goal on /drive and /rotate
 ros2 run turtlebot_controller stop_cli
 ```
+
+### Run the YOLO detector
+
+```bash
+ros2 run yolo_detector yolo_detector
+# or with parameters
+ros2 launch yolo_detector yolo_detector.launch.py \
+    weights_path:=/absolute/path/to/best.pt camera_device:=/dev/video0
+```
+
+Detections are published on `/yolo_detections`; view them with
+`ros2 topic echo /yolo_detections`.
 
 ## Tuning and safety notes
 

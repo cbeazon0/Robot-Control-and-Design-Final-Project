@@ -11,7 +11,7 @@ Dependencies (install with pip if missing):
 
 Run with:
 
-    ros2 run turtlebot_controller yolo_detector
+    ros2 run yolo_detector yolo_detector
 
 Parameters (all optional):
 

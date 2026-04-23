@@ -2,7 +2,8 @@
 
 Behavior
 --------
-Drive forward at ``linear_speed_mps`` (default 3 in/s ~ 0.0762 m/s).
+Drive forward at ``linear_speed_mps`` (default 1.5 in/s ~ 0.0381 m/s, to
+give the YOLO model time to keep up).
 When the robot gets within ``stop_distance_m`` (default 1 ft ~ 0.3048 m)
 of a calibrated sign, react based on its class:
 
@@ -26,7 +27,7 @@ Run with::
 Parameters::
 
     calibration_file       string   ''       REQUIRED; YAML from calibrate_signs
-    linear_speed_mps       double   0.0762   forward speed (= 3 in/s)
+    linear_speed_mps       double   0.0381   forward speed (= 1.5 in/s)
     stop_distance_m        double   0.3048   trigger threshold (= 1 ft)
     angular_speed_rps      double   0.6      rotation speed for turns
     min_confidence         double   0.50     drop YOLO msgs below this
@@ -58,7 +59,7 @@ from turtlebot_controller_msgs.action import Drive, Rotate
 CANON_CLASSES = {'Stop', 'Goal', 'Turn', 'Turn Around'}
 
 # Default numbers.
-DEFAULT_LINEAR_SPEED_MPS = 0.0762   # 3 in/s
+DEFAULT_LINEAR_SPEED_MPS = 0.0381   # 1.5 in/s (half of 3 in/s, slowed for YOLO latency)
 DEFAULT_STOP_DISTANCE_M = 0.3048    # 1 ft
 DEFAULT_ANGULAR_SPEED_RPS = 0.6
 RIGHT_TURN_RAD = -math.pi / 2.0     # 90 deg right
@@ -350,12 +351,22 @@ class SignFollower(Node):
     def _on_drive_accepted(self, future) -> None:
         handle = future.result()
         if handle is None or not handle.accepted:
-            self.get_logger().error('Drive goal rejected.')
+            self.get_logger().error(
+                'Drive goal rejected. Check: (1) is motion_controller running? '
+                "(2) 'ros2 action info /drive' shows exactly one server?"
+            )
             self._finish()
             return
+        pending_cancel = False
         with self._lock:
             self._goal_handle = handle
+            # If we tried to cancel before accept completed, do it now.
+            pending_cancel = self._pending_next_state is not None
+        self.get_logger().info('Drive goal accepted.')
         handle.get_result_async().add_done_callback(self._on_drive_result)
+        if pending_cancel:
+            self.get_logger().info('(Applying deferred cancel on Drive.)')
+            handle.cancel_goal_async()
 
     def _on_drive_result(self, future) -> None:
         result = future.result().result
@@ -436,7 +447,15 @@ class SignFollower(Node):
         with self._lock:
             handle = self._goal_handle
         if handle is not None:
+            self.get_logger().info('Requesting goal cancel.')
             handle.cancel_goal_async()
+        else:
+            # Accept callback hasn't fired yet. _on_drive_accepted will
+            # see _pending_next_state and cancel once the handle exists.
+            self.get_logger().info(
+                'Cancel requested before goal handle was available; '
+                'will cancel on accept.'
+            )
 
     def _finish(self) -> None:
         with self._lock:

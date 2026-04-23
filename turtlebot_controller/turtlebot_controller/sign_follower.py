@@ -2,39 +2,32 @@
 
 Behavior
 --------
-Drive forward at ``linear_speed_mps`` (default 1.5 in/s ~ 0.0381 m/s, to
-give the YOLO model time to keep up).
-When the robot gets within ``stop_distance_m`` (default 1 ft ~ 0.3048 m)
-of a calibrated sign, react based on its class:
+Drive forward at ``linear_speed_mps`` (default 1.5 in/s ~ 0.0381 m/s).
+As soon as the YOLO detector reports the same sign class ``stable_frames``
+times in a row (default 3) above ``min_confidence``, act on it:
 
 * ``Goal``         -> stop permanently and exit.
-* ``Stop``         -> halt while the Stop sign is still visible; resume
-                       driving after the sign has been absent for
-                       ``stop_release_s``.
+* ``Stop``         -> run the "go around" maneuver: wait 3 s, right 90,
+                       forward 1 ft, left 90, forward 1.5 ft, left 90,
+                       forward 1 ft, right 90, then resume forward drive.
 * ``Turn``         -> rotate 90 degrees right, then keep driving.
 * ``Turn Around``  -> rotate 180 degrees, then keep driving.
 
-Distance is computed from a YAML calibration file produced by
-``calibrate_signs``::
-
-    distance_m = reference_distance_m * ref_size_px / current_size_px
+No calibration or distance estimation is used. Place signs so they only
+come into YOLO's view at the distance where you want the robot to react.
 
 Run with::
 
-    ros2 run turtlebot_controller sign_follower --ros-args \\
-        -p calibration_file:=$HOME/sign_calibration.yaml
+    ros2 run turtlebot_controller sign_follower
 
 Parameters::
 
-    calibration_file       string   ''       REQUIRED; YAML from calibrate_signs
     linear_speed_mps       double   0.0381   forward speed (= 1.5 in/s)
-    stop_distance_m        double   0.3048   trigger threshold (= 1 ft)
+    maneuver_speed_mps     double   0.08     forward speed inside the Stop maneuver
     angular_speed_rps      double   0.6      rotation speed for turns
     min_confidence         double   0.50     drop YOLO msgs below this
-    stable_frames          int      2        require N consecutive good frames
+    stable_frames          int      3        N consecutive same-class frames
     post_turn_cooldown_s   double   1.5      ignore signs for this long after a turn
-    stop_release_s         double   1.0      resume when Stop absent this long
-    size_dimension         string   'width'  'width' | 'height' | 'max'
     detection_topic        string   '/yolo_detections'
 """
 
@@ -42,13 +35,11 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import sys
 import threading
 import time
 
 import rclpy
-import yaml
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from std_msgs.msg import String
@@ -59,43 +50,60 @@ from turtlebot_controller_msgs.action import Drive, Rotate
 CANON_CLASSES = {'Stop', 'Goal', 'Turn', 'Turn Around'}
 
 # Default numbers.
-DEFAULT_LINEAR_SPEED_MPS = 0.0381   # 1.5 in/s (half of 3 in/s, slowed for YOLO latency)
-DEFAULT_STOP_DISTANCE_M = 0.3048    # 1 ft
+DEFAULT_LINEAR_SPEED_MPS = 0.0381   # 1.5 in/s (slowed for YOLO latency)
+DEFAULT_MANEUVER_SPEED_MPS = 0.08   # a bit faster for the scripted Stop maneuver
 DEFAULT_ANGULAR_SPEED_RPS = 0.6
 RIGHT_TURN_RAD = -math.pi / 2.0     # 90 deg right
+LEFT_TURN_RAD = math.pi / 2.0       # 90 deg left
 TURN_AROUND_RAD = math.pi           # 180 deg
+
+ONE_FT_M = 0.3048
+ONE_AND_HALF_FT_M = 0.4572
 
 
 # States.
 S_DRIVING = 'DRIVING'
-S_STOPPED = 'STOPPED'
 S_TURNING = 'TURNING'
 S_TURNING_AROUND = 'TURNING_AROUND'
+S_MANEUVER = 'MANEUVER'
 S_FINISHED = 'FINISHED'
+
+
+# Stop maneuver: list of (kind, *args) tuples.
+#   ('wait',   seconds)
+#   ('rotate', angle_rad, label)
+#   ('drive',  distance_m, label)
+def _stop_maneuver_steps() -> list[tuple]:
+    return [
+        ('wait',   3.0),
+        ('rotate', RIGHT_TURN_RAD, 'stop-maneuver: right 90'),
+        ('drive',  ONE_FT_M, 'stop-maneuver: forward 1 ft'),
+        ('rotate', LEFT_TURN_RAD, 'stop-maneuver: left 90'),
+        ('drive',  ONE_AND_HALF_FT_M, 'stop-maneuver: forward 1.5 ft'),
+        ('rotate', LEFT_TURN_RAD, 'stop-maneuver: left 90'),
+        ('drive',  ONE_FT_M, 'stop-maneuver: forward 1 ft'),
+        ('rotate', RIGHT_TURN_RAD, 'stop-maneuver: right 90'),
+    ]
 
 
 class SignFollower(Node):
     def __init__(self) -> None:
         super().__init__('sign_follower')
 
-        self.declare_parameter('calibration_file', '')
         self.declare_parameter('linear_speed_mps', DEFAULT_LINEAR_SPEED_MPS)
-        self.declare_parameter('stop_distance_m', DEFAULT_STOP_DISTANCE_M)
+        self.declare_parameter('maneuver_speed_mps', DEFAULT_MANEUVER_SPEED_MPS)
         self.declare_parameter('angular_speed_rps', DEFAULT_ANGULAR_SPEED_RPS)
         self.declare_parameter('min_confidence', 0.50)
-        self.declare_parameter('stable_frames', 2)
+        self.declare_parameter('stable_frames', 3)
         self.declare_parameter('post_turn_cooldown_s', 1.5)
-        self.declare_parameter('stop_release_s', 1.0)
-        self.declare_parameter('size_dimension', 'width')
         self.declare_parameter('detection_topic', '/yolo_detections')
 
         p = self.get_parameter
-        calib_path = p('calibration_file').get_parameter_value().string_value.strip()
         self._linear_speed = float(
             p('linear_speed_mps').get_parameter_value().double_value
         )
-        self._stop_distance_m = float(
-            p('stop_distance_m').get_parameter_value().double_value
+        self._maneuver_speed = float(
+            p('maneuver_speed_mps').get_parameter_value().double_value
         )
         self._angular_speed = float(
             p('angular_speed_rps').get_parameter_value().double_value
@@ -109,27 +117,7 @@ class SignFollower(Node):
         self._post_turn_cooldown_s = float(
             p('post_turn_cooldown_s').get_parameter_value().double_value
         )
-        self._stop_release_s = float(
-            p('stop_release_s').get_parameter_value().double_value
-        )
-        self._size_dimension = (
-            p('size_dimension').get_parameter_value().string_value or 'width'
-        ).strip().lower()
-        if self._size_dimension not in ('width', 'height', 'max'):
-            self._size_dimension = 'width'
         detection_topic = p('detection_topic').get_parameter_value().string_value
-
-        if not calib_path:
-            self.get_logger().error(
-                "'calibration_file' parameter is required. Run calibrate_signs first."
-            )
-            raise SystemExit(2)
-        self._calibration_file = os.path.expanduser(calib_path)
-        self._calib_reference_distance_m: float = 0.0
-        self._calib_signs: dict[str, dict] = {}
-        self._load_calibration(self._calibration_file)
-        if not self._calib_signs:
-            raise SystemExit(2)
 
         self._drive_client = ActionClient(self, Drive, 'drive')
         self._rotate_client = ActionClient(self, Rotate, 'rotate')
@@ -137,82 +125,24 @@ class SignFollower(Node):
             String, detection_topic, self._on_detection, 10
         )
 
-        # Shared state, protected by self._lock. We use an RLock because
-        # some code paths (detection -> _trigger -> _cancel_goal) acquire
-        # the lock while already holding it on the same thread.
+        # Shared state, protected by self._lock. RLock because some paths
+        # (detection -> _trigger -> _cancel_goal) re-enter the lock.
         self._lock = threading.RLock()
         self._state = S_DRIVING
         self._goal_handle = None
         self._pending_next_state: str | None = None  # set when we cancel on purpose
         self._stable_count = 0
         self._pending_sign: str | None = None
-        self._last_stop_seen: float = 0.0
         self._cooldown_until: float = 0.0
+        self._maneuver_steps: list[tuple] = []
+        self._wait_timer = None
         self._done = threading.Event()
-
-        # A periodic timer handles "Stop sign is gone, resume driving".
-        self._timer = self.create_timer(0.2, self._on_tick)
 
         self.get_logger().info(
             f"sign_follower ready: speed={self._linear_speed:.3f} m/s, "
-            f"trigger when bbox >= calibration size "
-            f"(calibrated at {self._calib_reference_distance_m:.3f} m), "
-            f"classes={sorted(self._calib_signs.keys())}."
+            f"trigger after {self._stable_needed} consecutive detections "
+            f"(conf >= {self._min_conf:.2f}) of the same sign."
         )
-
-    # ----------------------------------------------------------- calibration
-
-    def _load_calibration(self, path: str) -> None:
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
-        except (OSError, yaml.YAMLError) as exc:
-            self.get_logger().error(
-                f"Failed to load calibration_file '{path}': {exc}."
-            )
-            return
-        ref = data.get('reference_distance_m')
-        signs = data.get('signs') or {}
-        if not isinstance(ref, (int, float)) or ref <= 0.0:
-            self.get_logger().error(
-                f"calibration_file '{path}' missing valid 'reference_distance_m'."
-            )
-            return
-        cleaned: dict[str, dict] = {}
-        for cls, entry in (signs or {}).items():
-            if not isinstance(entry, dict):
-                continue
-            try:
-                w_px = float(entry.get('w_px', 0.0))
-                h_px = float(entry.get('h_px', 0.0))
-            except (TypeError, ValueError):
-                continue
-            if w_px <= 0.0 or h_px <= 0.0:
-                continue
-            cleaned[str(cls)] = {'w_px': w_px, 'h_px': h_px}
-        if not cleaned:
-            self.get_logger().error(
-                f"calibration_file '{path}' had no usable entries."
-            )
-            return
-        self._calib_reference_distance_m = float(ref)
-        self._calib_signs = cleaned
-        missing = CANON_CLASSES - set(cleaned.keys())
-        if missing:
-            self.get_logger().warn(
-                f"Calibration is missing canonical class(es): {sorted(missing)}. "
-                'Those signs will be ignored at runtime.'
-            )
-
-    def _ref_size_for(self, cls_name: str) -> float:
-        entry = self._calib_signs.get(cls_name)
-        if not entry:
-            return 0.0
-        if self._size_dimension == 'height':
-            return float(entry.get('h_px', 0.0))
-        if self._size_dimension == 'max':
-            return max(float(entry.get('w_px', 0.0)), float(entry.get('h_px', 0.0)))
-        return float(entry.get('w_px', 0.0))
 
     # ------------------------------------------------------------- detection
 
@@ -224,54 +154,15 @@ class SignFollower(Node):
         conf = float(det.get('conf', 0.0))
         if conf < self._min_conf or cls_name not in CANON_CLASSES:
             return
-        if cls_name not in self._calib_signs:
-            return
 
         now = time.monotonic()
-        bw = float(det.get('w', 0.0))
-        bh = float(det.get('h', 0.0))
-        if self._size_dimension == 'height':
-            size_px = bh
-        elif self._size_dimension == 'max':
-            size_px = max(bw, bh)
-        else:
-            size_px = bw
-        if size_px <= 0.0:
-            return
-        ref_size = self._ref_size_for(cls_name)
-        if ref_size <= 0.0:
-            return
-
-        # Direct bbox comparison: bigger-than-calibration means the sign is
-        # closer than the calibration distance (pinhole geometry). We still
-        # compute an estimated distance for the log, but the trigger is the
-        # pixel-size comparison itself.
-        distance_m = self._calib_reference_distance_m * ref_size / size_px
-        trigger_ratio = size_px / ref_size   # >= 1.0 means "at or past" calib
 
         with self._lock:
-            state = self._state
+            if self._state != S_DRIVING:
+                return  # ignore detections while turning / mid-maneuver
 
-            # In STOPPED state, we only care about Stop-sign presence.
-            if state == S_STOPPED:
-                if cls_name == 'Stop' and trigger_ratio >= 1.0:
-                    self._last_stop_seen = now
-                return
-
-            if state != S_DRIVING:
-                return  # ignore everything while turning or cooldown-pending
-
-            # Cooldown: ignore detections for a bit after a turn.
+            # Cooldown: ignore detections for a bit after a turn/maneuver.
             if now < self._cooldown_until:
-                return
-
-            qualifies = trigger_ratio >= 1.0
-            if not qualifies:
-                # Reset the stability counter if either the class changes
-                # or the current one moves out of range.
-                if cls_name != self._pending_sign:
-                    self._pending_sign = cls_name
-                self._stable_count = 0
                 return
 
             if cls_name != self._pending_sign:
@@ -282,23 +173,19 @@ class SignFollower(Node):
 
             self.get_logger().info(
                 f"'{cls_name}' conf={conf:.2f} "
-                f"bbox_{self._size_dimension}={size_px:.0f}px "
-                f"(ref={ref_size:.0f}px, ratio={trigger_ratio:.2f}, "
-                f"~{distance_m:.2f} m) "
                 f"[{self._stable_count}/{self._stable_needed}]"
             )
 
             if self._stable_count >= self._stable_needed:
-                self._trigger(cls_name, distance_m)
+                self._trigger(cls_name)
 
-    def _trigger(self, cls_name: str, distance_m: float) -> None:
+    def _trigger(self, cls_name: str) -> None:
         """Assumes self._lock is held. Cancels Drive and schedules the
         next state based on the sign class."""
-        self.get_logger().info(
-            f"TRIGGER: '{cls_name}' at ~{distance_m:.2f} m."
-        )
+        self.get_logger().info(f"TRIGGER: '{cls_name}'.")
         if cls_name == 'Stop':
-            self._pending_next_state = S_STOPPED
+            self._maneuver_steps = _stop_maneuver_steps()
+            self._pending_next_state = S_MANEUVER
         elif cls_name == 'Goal':
             self._pending_next_state = S_FINISHED
         elif cls_name == 'Turn':
@@ -310,42 +197,90 @@ class SignFollower(Node):
             return
         self._cancel_goal()
 
-    # ---------------------------------------------------------------- timer
+    # ----------------------------------------------------------- maneuver
 
-    def _on_tick(self) -> None:
-        """Periodic housekeeping: Stop release + kick transitions."""
+    def _run_next_step(self) -> None:
+        """Pop and execute the next step of the Stop maneuver."""
         with self._lock:
-            state = self._state
+            if not self._maneuver_steps:
+                self._state = S_DRIVING
+                self._cooldown_until = (
+                    time.monotonic() + self._post_turn_cooldown_s
+                )
+                self._stable_count = 0
+                self._pending_sign = None
+                self.get_logger().info(
+                    'Stop maneuver complete; resuming forward drive.'
+                )
+                resume = True
+                step = None
+            else:
+                step = self._maneuver_steps.pop(0)
+                resume = False
 
-        now = time.monotonic()
-        if state == S_STOPPED:
-            with self._lock:
-                if now - self._last_stop_seen >= self._stop_release_s:
-                    self.get_logger().info(
-                        'Stop sign not seen for '
-                        f'{now - self._last_stop_seen:.1f} s; resuming drive.'
-                    )
-                    self._state = S_DRIVING
-                    # Apply cooldown so we don't instantly re-trigger on a
-                    # lingering Stop frame after we start moving.
-                    self._cooldown_until = now + self._post_turn_cooldown_s
-                    self._stable_count = 0
-                    self._pending_sign = None
-            if self._state == S_DRIVING:
-                self._send_drive_goal()
+        if resume:
+            self._send_drive_goal()
+            return
+
+        kind = step[0]
+        if kind == 'wait':
+            secs = float(step[1])
+            self.get_logger().info(f'Maneuver: wait {secs:.1f} s')
+            self._start_wait(secs)
+        elif kind == 'rotate':
+            angle = float(step[1])
+            label = str(step[2])
+            self._send_rotate_goal(angle, label)
+        elif kind == 'drive':
+            distance = float(step[1])
+            label = str(step[2])
+            self._send_drive_distance_goal(distance, label)
+        else:
+            self.get_logger().error(f'Unknown maneuver step: {step!r}')
+            self._finish()
+
+    def _start_wait(self, seconds: float) -> None:
+        # One-shot timer; we cancel + destroy it in the callback.
+        def _after() -> None:
+            t = self._wait_timer
+            self._wait_timer = None
+            if t is not None:
+                try:
+                    t.cancel()
+                    self.destroy_timer(t)
+                except Exception:
+                    pass
+            self._run_next_step()
+
+        self._wait_timer = self.create_timer(max(0.0, seconds), _after)
 
     # ----------------------------------------------------------- drive/rotate
 
     def _send_drive_goal(self) -> None:
+        """Send an open-ended Drive (distance=0) at the cruising speed."""
+        self._send_drive(
+            distance=0.0, speed=self._linear_speed, label='cruise'
+        )
+
+    def _send_drive_distance_goal(self, distance_m: float, label: str) -> None:
+        """Send a finite Drive at the maneuver speed."""
+        self._send_drive(
+            distance=float(distance_m),
+            speed=self._maneuver_speed,
+            label=label,
+        )
+
+    def _send_drive(self, distance: float, speed: float, label: str) -> None:
         if not self._drive_client.wait_for_server(timeout_sec=5.0):
             self.get_logger().error("/drive action server not available.")
             self._finish()
             return
         goal = Drive.Goal()
-        goal.distance = 0.0
-        goal.speed = self._linear_speed
+        goal.distance = float(distance)
+        goal.speed = float(speed)
         self.get_logger().info(
-            f"Sending Drive (distance=0, speed={self._linear_speed:.3f} m/s)."
+            f"Sending Drive ({label}: distance={distance:.3f} m, "
+            f"speed={speed:.3f} m/s)."
         )
         fut = self._drive_client.send_goal_async(goal)
         fut.add_done_callback(self._on_drive_accepted)
@@ -381,29 +316,44 @@ class SignFollower(Node):
             self._goal_handle = None
             next_state = self._pending_next_state
             self._pending_next_state = None
-            self._stable_count = 0
-            self._pending_sign = None
+            state = self._state
 
-        if next_state == S_STOPPED:
-            with self._lock:
-                self._state = S_STOPPED
-                self._last_stop_seen = time.monotonic()
-            self.get_logger().info('Entering STOPPED; waiting for Stop sign to clear.')
-        elif next_state == S_FINISHED:
+        if next_state == S_FINISHED:
             self.get_logger().info('Goal reached. Exiting.')
             self._finish()
-        elif next_state == S_TURNING:
+            return
+        if next_state == S_TURNING:
             with self._lock:
                 self._state = S_TURNING
+                self._stable_count = 0
+                self._pending_sign = None
             self._send_rotate_goal(RIGHT_TURN_RAD, 'right 90 deg')
-        elif next_state == S_TURNING_AROUND:
+            return
+        if next_state == S_TURNING_AROUND:
             with self._lock:
                 self._state = S_TURNING_AROUND
+                self._stable_count = 0
+                self._pending_sign = None
             self._send_rotate_goal(TURN_AROUND_RAD, '180 deg')
-        else:
-            # Drive finished on its own (e.g. odom watchdog); exit.
-            self.get_logger().warn('Drive ended without a pending transition; exiting.')
-            self._finish()
+            return
+        if next_state == S_MANEUVER:
+            with self._lock:
+                self._state = S_MANEUVER
+                self._stable_count = 0
+                self._pending_sign = None
+            self._run_next_step()
+            return
+
+        if state == S_MANEUVER:
+            # A maneuver sub-step drive finished; continue the sequence.
+            self._run_next_step()
+            return
+
+        # Drive ended on its own (e.g. odom watchdog) while cruising; exit.
+        self.get_logger().warn(
+            'Drive ended without a pending transition; exiting.'
+        )
+        self._finish()
 
     def _send_rotate_goal(self, angle_rad: float, label: str) -> None:
         if not self._rotate_client.wait_for_server(timeout_sec=5.0):
@@ -438,8 +388,18 @@ class SignFollower(Node):
         )
         with self._lock:
             self._goal_handle = None
+            state = self._state
+
+        if state == S_MANEUVER:
+            self._run_next_step()
+            return
+
+        # Normal Turn / Turn Around: resume cruising.
+        with self._lock:
             self._state = S_DRIVING
-            self._cooldown_until = time.monotonic() + self._post_turn_cooldown_s
+            self._cooldown_until = (
+                time.monotonic() + self._post_turn_cooldown_s
+            )
             self._stable_count = 0
             self._pending_sign = None
         self._send_drive_goal()

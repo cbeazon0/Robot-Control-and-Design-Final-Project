@@ -137,8 +137,10 @@ class SignFollower(Node):
             String, detection_topic, self._on_detection, 10
         )
 
-        # Shared state, protected by self._lock.
-        self._lock = threading.Lock()
+        # Shared state, protected by self._lock. We use an RLock because
+        # some code paths (detection -> _trigger -> _cancel_goal) acquire
+        # the lock while already holding it on the same thread.
+        self._lock = threading.RLock()
         self._state = S_DRIVING
         self._goal_handle = None
         self._pending_next_state: str | None = None  # set when we cancel on purpose

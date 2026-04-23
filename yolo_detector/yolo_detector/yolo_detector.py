@@ -16,7 +16,7 @@ Run with:
 Parameters (all optional):
 
     weights_path    : absolute path to the .pt file. If empty, the node
-                      searches parent directories for 'src/best.pt'.
+                      searches parent directories for 'best.pt'.
     camera_device   : OpenCV-compatible device (default '/dev/video0').
     detect_rate_hz  : how often to grab a frame and run inference.
     min_confidence  : drop detections below this score.
@@ -188,17 +188,17 @@ def preprocess_frame(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _find_default_weights() -> str:
-    """Walk up from this file looking for a 'src/best.pt'."""
+    """Walk up from this file looking for 'best.pt'."""
     here = os.path.abspath(os.path.dirname(__file__))
     probe = here
     for _ in range(8):
         probe = os.path.dirname(probe)
         if not probe or probe == '/':
             break
-        cand = os.path.join(probe, 'src', 'best.pt')
+        cand = os.path.join(probe, 'best.pt')
         if os.path.isfile(cand):
             return cand
-    return os.path.join(os.getcwd(), 'src', 'best.pt')
+    return os.path.join(os.getcwd(), 'best.pt')
 
 
 class YoloDetectorNode(Node):

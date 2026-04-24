@@ -3,7 +3,7 @@
 <package format="3">
   <name>yolo_detector</name>
   <version>0.1.0</version>
-  <description>YOLO-based red/quadrilateral detector node. Reads frames from a USB camera, applies a red-on-dark preprocessing pipeline, runs a YOLO model, and publishes detections.</description>
+  <description>YOLO detector: USB camera frames (BGR) passed straight into Ultralytics — same as training data, no opencv mask pipeline.</description>
   <maintainer email="user@example.com">clay</maintainer>
   <license>MIT</license>
 
@@ -11,7 +11,6 @@
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
-  <exec_depend>python3-sklearn</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

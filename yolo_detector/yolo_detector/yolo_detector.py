@@ -4,149 +4,13 @@ import json
 import os
 
 import cv2
-import numpy as np
 import rclpy
 from rclpy.node import Node
-from sklearn.cluster import DBSCAN
 from std_msgs.msg import String
 from ultralytics import YOLO
 
-# tuned on our calibration frames
-MIN_BLOB_AREA = 200
-EPS_PIXELS = 50
-MORPH_KERNEL = (5, 5)
-PAD = 20
-DARK_THRESH = 60
-MIN_DARK_CONTOUR_AREA = 200
-
+# inference timer (grabs + runs YOLO at this rate)
 DETECT_RATE_HZ = 1.0
-
-
-def preprocess_frame(img: np.ndarray) -> np.ndarray:
-    h, w = img.shape[:2]
-
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    lower1 = np.array([0, 120, 50])
-    upper1 = np.array([10, 255, 255])
-    lower2 = np.array([170, 120, 50])
-    upper2 = np.array([179, 255, 255])
-
-    mask_red = cv2.bitwise_or(
-        cv2.inRange(hsv, lower1, upper1),
-        cv2.inRange(hsv, lower2, upper2),
-    )
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, MORPH_KERNEL)
-    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel, iterations=1)
-    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    contours, _ = cv2.findContours(
-        mask_red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    points: list[list[float]] = []
-    bboxes: list[tuple[int, int, int, int]] = []
-
-    for c in contours:
-        if cv2.contourArea(c) < MIN_BLOB_AREA:
-            continue
-        m = cv2.moments(c)
-        if m['m00'] == 0:
-            continue
-        cx = m['m10'] / m['m00']
-        cy = m['m01'] / m['m00']
-        x, y, bw_w, bw_h = cv2.boundingRect(c)
-        points.append([cx, cy])
-        bboxes.append((x, y, bw_w, bw_h))
-
-    red_clusters: dict[int, list] = {}
-    cluster_bboxes: dict[int, tuple[int, int, int, int]] = {}
-
-    if points:
-        pts = np.array(points)
-        labels = DBSCAN(eps=EPS_PIXELS, min_samples=1).fit(pts).labels_
-        for i, lbl in enumerate(labels):
-            red_clusters.setdefault(int(lbl), []).append(bboxes[i])
-
-    for lbl, members in red_clusters.items():
-        xs, ys, x2s, y2s = [], [], [], []
-        for bb in members:
-            x, y, bw_w, bw_h = bb
-            xs.append(x)
-            ys.append(y)
-            x2s.append(x + bw_w)
-            y2s.append(y + bw_h)
-        x_min = max(0, int(min(xs)) - PAD)
-        y_min = max(0, int(min(ys)) - PAD)
-        x_max = min(w - 1, int(max(x2s)) + PAD)
-        y_max = min(h - 1, int(max(y2s)) + PAD)
-        cluster_bboxes[lbl] = (x_min, y_min, x_max - x_min, y_max - y_min)
-
-    quad_mask_global = np.zeros((h, w), dtype=np.uint8)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    k_roi = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-
-    for _lbl, (x_min, y_min, gw, gh) in cluster_bboxes.items():
-        roi_gray = gray[y_min:y_min + gh, x_min:x_min + gw]
-        roi_mask_red = mask_red[y_min:y_min + gh, x_min:x_min + gw]
-
-        _, dark_mask = cv2.threshold(
-            roi_gray, DARK_THRESH, 255, cv2.THRESH_BINARY_INV
-        )
-        dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, k_roi)
-        dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, k_roi)
-
-        red_dil = cv2.dilate(roi_mask_red, k_roi, iterations=10)
-        focused_dark = cv2.bitwise_and(dark_mask, cv2.bitwise_not(red_dil))
-
-        d_cnts, _ = cv2.findContours(
-            focused_dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-
-        quads = []
-        for c in d_cnts:
-            if cv2.contourArea(c) < MIN_DARK_CONTOUR_AREA:
-                continue
-            approx = cv2.approxPolyDP(c, 0.02 * cv2.arcLength(c, True), True)
-            if len(approx) == 4 and cv2.isContourConvex(approx):
-                quads.append(approx)
-
-        red_pts = np.column_stack(np.where(roi_mask_red > 0))
-        if len(red_pts) == 0:
-            continue
-
-        cy, cx = np.mean(red_pts, axis=0)
-        red_center = (int(cx), int(cy))
-
-        best_quad = None
-        best_score = -1
-        for approx in quads:
-            inside = cv2.pointPolygonTest(approx, red_center, False) >= 0
-            quad_mask = np.zeros((gh, gw), dtype=np.uint8)
-            cv2.drawContours(quad_mask, [approx], -1, 255, -1)
-            red_inside = cv2.bitwise_and(
-                roi_mask_red, roi_mask_red, mask=quad_mask
-            )
-            score = cv2.countNonZero(red_inside) + (100000 if inside else 0)
-            if score > best_score:
-                best_score = score
-                best_quad = approx
-
-        if best_quad is not None:
-            best_quad_global = best_quad + np.array([[x_min, y_min]])
-            cv2.drawContours(quad_mask_global, [best_quad_global], -1, 255, -1)
-
-    final_mask = cv2.bitwise_and(mask_red, quad_mask_global)
-
-    # cranked red channel so the network sees the same thing we trained on
-    b, g, r = cv2.split(cv2.bitwise_and(img, img, mask=final_mask))
-    r = cv2.add(r, 100)
-    g = cv2.multiply(g, 0.5)
-    b = cv2.multiply(b, 0.5)
-    result_boost = cv2.merge([b, g, r])
-    result_boost = cv2.bitwise_and(result_boost, result_boost, mask=final_mask)
-
-    return result_boost
 
 
 class YoloDetectorNode(Node):
@@ -258,16 +122,11 @@ class YoloDetectorNode(Node):
             self.get_logger().warn('Failed to read frame from camera.')
             return
 
-        try:
-            processed = preprocess_frame(frame)
-        except Exception as exc:  # noqa: BLE001
-            self.get_logger().error('preprocess: %s' % (exc,))
-            return
-
-        img_h, img_w = processed.shape[:2]
+        # OpenCV BGR, unmodified — must match what you trained on (camera / resize in YOLO)
+        img_h, img_w = frame.shape[:2]
 
         results = self._model.predict(
-            source=processed,
+            source=frame,
             verbose=False,
             save=False,
             show=False,

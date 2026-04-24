@@ -18,12 +18,12 @@ Three ROS2 packages:
   - `drive_cli`, `rotate_cli`, `stop_cli` — convenience command-line
     clients.
 - `yolo_detector/` (ament_python) — standalone perception node:
-  - `yolo_detector` — reads frames from a USB camera
-    (default `/dev/video0`), runs a red/dark-quadrilateral preprocessing
-    pipeline, feeds the result into a YOLO model (`best.pt`), and
-    publishes each detection as a `std_msgs/String` (`"class:conf"`) on
-    `/yolo_detections`. Requires `pip install ultralytics opencv-python
-    scikit-learn numpy`.
+  - `yolo_detector` — reads **raw** BGR frames from a USB camera
+    (default `/dev/video0`) and runs your `best.pt` on them (same
+    as training — no opencv mask/boost step). Publishes each detection
+    as JSON in `std_msgs/String` on `/yolo_detections`. Needs
+    `pip install ultralytics` (and opencv / numpy, often via system or
+    venv with your YOLO env).
 
 The TurtleBot base driver already publishes `/odom`, so this project only
 **consumes** odometry; it does not generate it.

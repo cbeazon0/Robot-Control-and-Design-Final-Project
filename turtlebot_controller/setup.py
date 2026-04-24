@@ -29,7 +29,6 @@ setup(
             'drive_cli = turtlebot_controller.cli:drive_main',
             'rotate_cli = turtlebot_controller.cli:rotate_main',
             'stop_cli = turtlebot_controller.cli:stop_main',
-            'forward_right_forward = turtlebot_controller.forward_right_forward:main',
             'sign_follower = turtlebot_controller.sign_follower:main',
         ],
     },

@@ -11,27 +11,35 @@ Two capture modes
 
 Saved files
 -----------
+Every image is prefixed with the sign label supplied via ``--label``:
+
+    <label>_<NNNN>.jpg               (raw frame)
+    <label>_<NNNN>_proc.jpg          (if --save-processed)
+
+Allowed labels: ``Stop``, ``Turn_Around``, ``Right_Turn``, ``Left_Turn``,
+``Goal``. Case-insensitive; spaces/hyphens are accepted (``"Turn Around"``
+becomes ``Turn_Around``).
+
 By default frames are written under
-``~/yolo_dataset/<run_id>/raw_<NNNN>.jpg``. With ``--save-processed`` the
-preprocessed frame (red+quad mask, the same one fed to YOLO) is also saved
-as ``proc_<NNNN>.jpg`` next to the raw one.
+``~/yolo_dataset/<label>/<run_id>/``.
 
 Usage
 -----
 ::
 
-    # auto-capture every 2 s, save to a timestamped folder
-    ros2 run yolo_detector capture_dataset
+    # auto-capture Stop-sign shots every 2 s
+    ros2 run yolo_detector capture_dataset --label Stop
 
     # press Enter to snap, custom output dir
-    ros2 run yolo_detector capture_dataset --mode manual \\
-        --output-dir ~/yolo_dataset/stop_signs
+    ros2 run yolo_detector capture_dataset --label Right_Turn --mode manual \\
+        --output-dir ~/yolo_dataset
 
     # also save the preprocessed (red/quad) frames
-    ros2 run yolo_detector capture_dataset --save-processed
+    ros2 run yolo_detector capture_dataset --label Goal --save-processed
 
     # different camera node
-    ros2 run yolo_detector capture_dataset --camera-device /dev/video1
+    ros2 run yolo_detector capture_dataset --label Left_Turn \\
+        --camera-device /dev/video1
 
 You can also use it without ``ros2 run`` -- it's just a regular Python
 script::
@@ -90,18 +98,46 @@ def _open_camera(device: str) -> cv2.VideoCapture:
     )
 
 
-def _next_run_dir(base: str) -> str:
-    """Return ``base/run_YYYYmmdd_HHMMSS``, creating it if needed."""
+# Canonical label set. Keys are the lowercase normalized form; values are
+# the filename-safe label (no spaces).
+LABEL_CHOICES: dict[str, str] = {
+    'stop': 'Stop',
+    'turn_around': 'Turn_Around',
+    'turnaround': 'Turn_Around',
+    'right_turn': 'Right_Turn',
+    'rightturn': 'Right_Turn',
+    'left_turn': 'Left_Turn',
+    'leftturn': 'Left_Turn',
+    'goal': 'Goal',
+}
+
+
+def _normalize_label(raw: str) -> str:
+    """Map any accepted spelling to its canonical filename form."""
+    key = raw.strip().lower().replace(' ', '_').replace('-', '_')
+    while '__' in key:
+        key = key.replace('__', '_')
+    if key not in LABEL_CHOICES:
+        canonical = sorted(set(LABEL_CHOICES.values()))
+        raise argparse.ArgumentTypeError(
+            f"Invalid --label '{raw}'. Allowed: {canonical}"
+        )
+    return LABEL_CHOICES[key]
+
+
+def _next_run_dir(base: str, label: str) -> str:
+    """Return ``base/<label>/run_YYYYmmdd_HHMMSS``, creating it if needed."""
     stamp = _dt.datetime.now().strftime('run_%Y%m%d_%H%M%S')
-    out = os.path.join(base, stamp)
+    out = os.path.join(base, label, stamp)
     os.makedirs(out, exist_ok=True)
     return out
 
 
-def _save_frame(out_dir: str, idx: int, frame, save_processed: bool,
+def _save_frame(out_dir: str, label: str, idx: int, frame,
+                save_processed: bool,
                 jpeg_quality: int) -> tuple[str, str | None]:
     """Write the raw (and optionally processed) frame. Returns paths."""
-    raw_path = os.path.join(out_dir, f'raw_{idx:04d}.jpg')
+    raw_path = os.path.join(out_dir, f'{label}_{idx:04d}.jpg')
     cv2.imwrite(raw_path, frame, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality])
 
     proc_path: str | None = None
@@ -114,7 +150,7 @@ def _save_frame(out_dir: str, idx: int, frame, save_processed: bool,
             )
         try:
             processed, _ = preprocess_frame(frame)
-            proc_path = os.path.join(out_dir, f'proc_{idx:04d}.jpg')
+            proc_path = os.path.join(out_dir, f'{label}_{idx:04d}_proc.jpg')
             cv2.imwrite(
                 proc_path, processed,
                 [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality],
@@ -143,13 +179,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description='Capture camera frames for YOLO fine-tuning.',
     )
     parser.add_argument(
+        '--label', required=True, type=_normalize_label,
+        help='Sign label for the whole run. One of: '
+             'Stop, Turn_Around, Right_Turn, Left_Turn, Goal. '
+             'Case-insensitive; spaces/hyphens are accepted.',
+    )
+    parser.add_argument(
         '--camera-device', default='/dev/video0',
         help='Camera device path or index (default: /dev/video0).',
     )
     parser.add_argument(
         '--output-dir', default=os.path.expanduser('~/yolo_dataset'),
-        help='Base output directory. A timestamped subfolder is created '
-             'inside it (default: ~/yolo_dataset).',
+        help='Base output directory. Frames are written to '
+             '<output-dir>/<label>/run_<timestamp>/ '
+             '(default: ~/yolo_dataset).',
     )
     parser.add_argument(
         '--mode', choices=('interval', 'manual'), default='interval',
@@ -184,7 +227,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
-    out_dir = _next_run_dir(os.path.expanduser(args.output_dir))
+    out_dir = _next_run_dir(os.path.expanduser(args.output_dir), args.label)
+    print(f"[capture] label={args.label}", flush=True)
     print(f"[capture] saving frames to: {out_dir}", flush=True)
     print(f"[capture] mode={args.mode}, "
           f"interval={args.interval:.2f}s, "
@@ -245,6 +289,7 @@ def main(argv: list[str] | None = None) -> int:
             count += 1
             raw_path, proc_path = _save_frame(
                 out_dir=out_dir,
+                label=args.label,
                 idx=count,
                 frame=frame,
                 save_processed=args.save_processed,

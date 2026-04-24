@@ -24,6 +24,7 @@ setup(
     entry_points={
         'console_scripts': [
             'yolo_detector = yolo_detector.yolo_detector:main',
+            'capture_dataset = yolo_detector.capture_dataset:main',
         ],
     },
 )

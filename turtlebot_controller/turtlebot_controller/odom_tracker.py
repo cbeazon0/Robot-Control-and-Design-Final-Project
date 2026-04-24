@@ -1,11 +1,3 @@
-"""Process `/odom` and publish a cleaned 2D robot state + cumulative distance.
-
-The TurtleBot base already publishes `nav_msgs/Odometry` on `/odom`. This node
-does not add new information; it just extracts the pieces that are easy to
-consume downstream (x, y, yaw in radians, cumulative driven distance) so that
-other code does not have to repeat quaternion math.
-"""
-
 import math
 
 import rclpy
@@ -18,7 +10,7 @@ from std_msgs.msg import Float64
 
 
 def yaw_from_quaternion(qx: float, qy: float, qz: float, qw: float) -> float:
-    """Return yaw (rotation about +Z) in radians from a unit quaternion."""
+    #Return yaw (rotation about +Z) in radians from a unit quaternion
     siny_cosp = 2.0 * (qw * qz + qx * qy)
     cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
     return math.atan2(siny_cosp, cosy_cosp)

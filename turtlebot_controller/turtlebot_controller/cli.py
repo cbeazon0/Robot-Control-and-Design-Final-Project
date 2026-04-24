@@ -1,15 +1,3 @@
-"""Command-line helpers for the motion controller action servers.
-
-Installed as three console scripts:
-
-* ``ros2 run turtlebot_controller drive_cli <distance_m> [speed]``
-  - ``<distance_m>``: meters; ``0`` (or omit) means "drive until Ctrl-C".
-* ``ros2 run turtlebot_controller rotate_cli <angle_deg> [angular_speed]``
-  - ``<angle_deg>``: signed degrees (``90``, ``-90``, ``180``, ...).
-* ``ros2 run turtlebot_controller stop_cli``
-  - Cancels any active Drive or Rotate goal on this controller.
-"""
-
 from __future__ import annotations
 
 import math
@@ -225,11 +213,6 @@ def rotate_main(args=None) -> None:
 
 
 def stop_main(args=None) -> None:
-    """Cancel every active Drive and Rotate goal on this controller.
-
-    Calls the action-level ``_action/cancel_goal`` service on both servers
-    with an empty request, which cancels all goals on each.
-    """
     from action_msgs.srv import CancelGoal
 
     rclpy.init(args=args)

@@ -14,7 +14,8 @@ Actions:
 * ``Stop``         -> run the "go around" maneuver: wait 3 s, right 90,
                        forward 1 ft, left 90, forward 1.5 ft, left 90,
                        forward 1 ft, right 90, then resume forward drive.
-* ``Turn``         -> rotate 90 degrees right, then keep driving.
+* ``Turn Left``    -> rotate 90 degrees left (CCW), then keep driving.
+* ``Turn Right``   -> rotate 90 degrees right (CW), then keep driving.
 * ``Turn Around``  -> rotate 180 degrees, then keep driving.
 
 No calibration or distance estimation is used; bbox width in pixels is the
@@ -30,7 +31,7 @@ Parameters::
     maneuver_speed_mps     double   0.12     forward speed inside the Stop maneuver
     angular_speed_rps      double   1.0      rotation speed for turns
     trigger_confidence     double   0.75     minimum YOLO confidence to act
-    trigger_width_px       double   75.0     minimum bbox width (pixels) to act
+    trigger_width_px       double   70.0     minimum bbox width (pixels) to act
     post_turn_cooldown_s   double   3.0      ignore signs for this long after any motion
     detection_topic        string   '/yolo_detections'
 """
@@ -51,7 +52,7 @@ from std_msgs.msg import String
 from turtlebot_controller_msgs.action import Drive, Rotate
 
 
-CANON_CLASSES = {'Stop', 'Goal', 'Turn', 'Turn Around'}
+CANON_CLASSES = {'Stop', 'Goal', 'Turn Left', 'Turn Right', 'Turn Around'}
 
 # Default numbers.
 DEFAULT_LINEAR_SPEED_MPS = 0.0381   # 1.5 in/s (slowed for YOLO latency)
@@ -98,7 +99,7 @@ class SignFollower(Node):
         self.declare_parameter('maneuver_speed_mps', DEFAULT_MANEUVER_SPEED_MPS)
         self.declare_parameter('angular_speed_rps', DEFAULT_ANGULAR_SPEED_RPS)
         self.declare_parameter('trigger_confidence', 0.75)
-        self.declare_parameter('trigger_width_px', 75.0)
+        self.declare_parameter('trigger_width_px', 70.0)
         self.declare_parameter('post_turn_cooldown_s', 3.0)
         self.declare_parameter('detection_topic', '/yolo_detections')
 
@@ -135,6 +136,8 @@ class SignFollower(Node):
         self._state = S_DRIVING
         self._goal_handle = None
         self._pending_next_state: str | None = None  # set when we cancel on purpose
+        self._pending_turn_rad: float = 0.0           # angle for S_TURNING
+        self._pending_turn_label: str = ''
         self._cooldown_until: float = 0.0
         self._maneuver_steps: list[tuple] = []
         self._wait_timer = None
@@ -194,8 +197,14 @@ class SignFollower(Node):
             self._pending_next_state = S_MANEUVER
         elif cls_name == 'Goal':
             self._pending_next_state = S_FINISHED
-        elif cls_name == 'Turn':
+        elif cls_name == 'Turn Left':
             self._pending_next_state = S_TURNING
+            self._pending_turn_rad = LEFT_TURN_RAD
+            self._pending_turn_label = 'left 90 deg'
+        elif cls_name == 'Turn Right':
+            self._pending_next_state = S_TURNING
+            self._pending_turn_rad = RIGHT_TURN_RAD
+            self._pending_turn_label = 'right 90 deg'
         elif cls_name == 'Turn Around':
             self._pending_next_state = S_TURNING_AROUND
         else:
@@ -329,7 +338,11 @@ class SignFollower(Node):
         if next_state == S_TURNING:
             with self._lock:
                 self._state = S_TURNING
-            self._send_rotate_goal(RIGHT_TURN_RAD, 'right 90 deg')
+                angle = self._pending_turn_rad
+                label = self._pending_turn_label or (
+                    f'{math.degrees(angle):+.0f} deg'
+                )
+            self._send_rotate_goal(angle, label)
             return
         if next_state == S_TURNING_AROUND:
             with self._lock:

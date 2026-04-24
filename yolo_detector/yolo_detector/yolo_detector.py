@@ -24,8 +24,8 @@ class YoloDetectorNode(Node):
         self.declare_parameter(
             'class_aliases',
             [
-                'Left Arrow=Turn',
-                'Right Arrow=Turn',
+                'Left Arrow=Turn Left',
+                'Right Arrow=Turn Right',
                 'Left Turn=Turn Around',
                 'Right Turn=Turn Around',
             ],

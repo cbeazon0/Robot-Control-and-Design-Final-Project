@@ -12,7 +12,7 @@ Actions:
 
 * ``Goal``         -> stop permanently and exit.
 * ``Stop``         -> run the "go around" maneuver: wait 3 s, right 90,
-                       forward 1 ft, left 90, forward 1.5 ft, left 90,
+                       forward 1 ft, left 90, forward 2 ft, left 90,
                        forward 1 ft, right 90, then resume forward drive.
 * ``Turn Left``    -> rotate 90 degrees left (CCW), then keep driving.
 * ``Turn Right``   -> rotate 90 degrees right (CW), then keep driving.
@@ -63,7 +63,7 @@ LEFT_TURN_RAD = math.pi / 2.0       # 90 deg left
 TURN_AROUND_RAD = math.pi           # 180 deg
 
 ONE_FT_M = 0.3048
-ONE_AND_HALF_FT_M = 0.4572
+TWO_FT_M = 0.6096
 
 
 # States.
@@ -84,7 +84,7 @@ def _stop_maneuver_steps() -> list[tuple]:
         ('rotate', RIGHT_TURN_RAD, 'stop-maneuver: right 90'),
         ('drive',  ONE_FT_M, 'stop-maneuver: forward 1 ft'),
         ('rotate', LEFT_TURN_RAD, 'stop-maneuver: left 90'),
-        ('drive',  ONE_AND_HALF_FT_M, 'stop-maneuver: forward 1.5 ft'),
+        ('drive',  TWO_FT_M, 'stop-maneuver: forward 2 ft'),
         ('rotate', LEFT_TURN_RAD, 'stop-maneuver: left 90'),
         ('drive',  ONE_FT_M, 'stop-maneuver: forward 1 ft'),
         ('rotate', RIGHT_TURN_RAD, 'stop-maneuver: right 90'),

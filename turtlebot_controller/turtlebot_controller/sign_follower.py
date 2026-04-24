@@ -3,8 +3,12 @@
 Behavior
 --------
 Drive forward at ``linear_speed_mps`` (default 1.5 in/s ~ 0.0381 m/s).
-As soon as the YOLO detector reports the same sign class ``stable_frames``
-times in a row (default 3) above ``min_confidence``, act on it:
+Trigger on a sign the moment a YOLO detection is both confident enough
+and *close enough* (= bounding box wide enough in the image):
+
+    trigger if (conf >= trigger_confidence) and (bbox_width_px >= trigger_width_px)
+
+Actions:
 
 * ``Goal``         -> stop permanently and exit.
 * ``Stop``         -> run the "go around" maneuver: wait 3 s, right 90,
@@ -13,8 +17,8 @@ times in a row (default 3) above ``min_confidence``, act on it:
 * ``Turn``         -> rotate 90 degrees right, then keep driving.
 * ``Turn Around``  -> rotate 180 degrees, then keep driving.
 
-No calibration or distance estimation is used. Place signs so they only
-come into YOLO's view at the distance where you want the robot to react.
+No calibration or distance estimation is used; bbox width in pixels is the
+(approximate) proxy for "we're close enough to the sign to act".
 
 Run with::
 
@@ -23,10 +27,10 @@ Run with::
 Parameters::
 
     linear_speed_mps       double   0.0381   forward speed (= 1.5 in/s)
-    maneuver_speed_mps     double   0.08     forward speed inside the Stop maneuver
-    angular_speed_rps      double   0.6      rotation speed for turns
-    min_confidence         double   0.25     drop YOLO msgs below this (match yolo_detector)
-    stable_frames          int      3        N consecutive same-class frames
+    maneuver_speed_mps     double   0.12     forward speed inside the Stop maneuver
+    angular_speed_rps      double   1.0      rotation speed for turns
+    trigger_confidence     double   0.75     minimum YOLO confidence to act
+    trigger_width_px       double   110.0    minimum bbox width (pixels) to act
     post_turn_cooldown_s   double   3.0      ignore signs for this long after any motion
     detection_topic        string   '/yolo_detections'
 """
@@ -51,8 +55,8 @@ CANON_CLASSES = {'Stop', 'Goal', 'Turn', 'Turn Around'}
 
 # Default numbers.
 DEFAULT_LINEAR_SPEED_MPS = 0.0381   # 1.5 in/s (slowed for YOLO latency)
-DEFAULT_MANEUVER_SPEED_MPS = 0.08   # a bit faster for the scripted Stop maneuver
-DEFAULT_ANGULAR_SPEED_RPS = 0.6
+DEFAULT_MANEUVER_SPEED_MPS = 0.12   # a bit faster for the scripted Stop maneuver
+DEFAULT_ANGULAR_SPEED_RPS = 1
 RIGHT_TURN_RAD = -math.pi / 2.0     # 90 deg right
 LEFT_TURN_RAD = math.pi / 2.0       # 90 deg left
 TURN_AROUND_RAD = math.pi           # 180 deg
@@ -93,8 +97,8 @@ class SignFollower(Node):
         self.declare_parameter('linear_speed_mps', DEFAULT_LINEAR_SPEED_MPS)
         self.declare_parameter('maneuver_speed_mps', DEFAULT_MANEUVER_SPEED_MPS)
         self.declare_parameter('angular_speed_rps', DEFAULT_ANGULAR_SPEED_RPS)
-        self.declare_parameter('min_confidence', 0.25)
-        self.declare_parameter('stable_frames', 3)
+        self.declare_parameter('trigger_confidence', 0.75)
+        self.declare_parameter('trigger_width_px', 110.0)
         self.declare_parameter('post_turn_cooldown_s', 3.0)
         self.declare_parameter('detection_topic', '/yolo_detections')
 
@@ -108,11 +112,11 @@ class SignFollower(Node):
         self._angular_speed = float(
             p('angular_speed_rps').get_parameter_value().double_value
         )
-        self._min_conf = float(
-            p('min_confidence').get_parameter_value().double_value
+        self._trigger_conf = float(
+            p('trigger_confidence').get_parameter_value().double_value
         )
-        self._stable_needed = max(
-            1, int(p('stable_frames').get_parameter_value().integer_value)
+        self._trigger_width_px = float(
+            p('trigger_width_px').get_parameter_value().double_value
         )
         self._post_turn_cooldown_s = float(
             p('post_turn_cooldown_s').get_parameter_value().double_value
@@ -131,8 +135,6 @@ class SignFollower(Node):
         self._state = S_DRIVING
         self._goal_handle = None
         self._pending_next_state: str | None = None  # set when we cancel on purpose
-        self._stable_count = 0
-        self._pending_sign: str | None = None
         self._cooldown_until: float = 0.0
         self._maneuver_steps: list[tuple] = []
         self._wait_timer = None
@@ -140,8 +142,8 @@ class SignFollower(Node):
 
         self.get_logger().info(
             f"sign_follower ready: speed={self._linear_speed:.3f} m/s, "
-            f"trigger after {self._stable_needed} consecutive detections "
-            f"(conf >= {self._min_conf:.2f}) of the same sign."
+            f"trigger when conf>={self._trigger_conf:.2f} and "
+            f"bbox_w>={self._trigger_width_px:.0f}px."
         )
 
     # ------------------------------------------------------------- detection
@@ -152,12 +154,7 @@ class SignFollower(Node):
             return
         cls_name = str(det.get('class', ''))
         conf = float(det.get('conf', 0.0))
-        if conf < self._min_conf:
-            self.get_logger().info(
-                f"drop '{cls_name}' conf={conf:.2f} "
-                f"(below min_confidence={self._min_conf:.2f})"
-            )
-            return
+        width = float(det.get('w', 0.0))
         if cls_name not in CANON_CLASSES:
             self.get_logger().info(
                 f"drop class '{cls_name}' (not in {sorted(CANON_CLASSES)})"
@@ -174,18 +171,18 @@ class SignFollower(Node):
             if now < self._cooldown_until:
                 return
 
-            if cls_name != self._pending_sign:
-                self._pending_sign = cls_name
-                self._stable_count = 1
-            else:
-                self._stable_count += 1
-
+            ready = (
+                conf >= self._trigger_conf
+                and width >= self._trigger_width_px
+            )
             self.get_logger().info(
-                f"'{cls_name}' conf={conf:.2f} "
-                f"[{self._stable_count}/{self._stable_needed}]"
+                f"'{cls_name}' conf={conf:.2f} w={width:.0f}px "
+                f"(need conf>={self._trigger_conf:.2f}, "
+                f"w>={self._trigger_width_px:.0f}) -> "
+                f"{'TRIGGER' if ready else 'wait'}"
             )
 
-            if self._stable_count >= self._stable_needed:
+            if ready:
                 self._trigger(cls_name)
 
     def _trigger(self, cls_name: str) -> None:
@@ -216,8 +213,6 @@ class SignFollower(Node):
                 self._cooldown_until = (
                     time.monotonic() + self._post_turn_cooldown_s
                 )
-                self._stable_count = 0
-                self._pending_sign = None
                 self.get_logger().info(
                     'Stop maneuver complete; resuming forward drive.'
                 )
@@ -334,22 +329,16 @@ class SignFollower(Node):
         if next_state == S_TURNING:
             with self._lock:
                 self._state = S_TURNING
-                self._stable_count = 0
-                self._pending_sign = None
             self._send_rotate_goal(RIGHT_TURN_RAD, 'right 90 deg')
             return
         if next_state == S_TURNING_AROUND:
             with self._lock:
                 self._state = S_TURNING_AROUND
-                self._stable_count = 0
-                self._pending_sign = None
             self._send_rotate_goal(TURN_AROUND_RAD, '180 deg')
             return
         if next_state == S_MANEUVER:
             with self._lock:
                 self._state = S_MANEUVER
-                self._stable_count = 0
-                self._pending_sign = None
             self._run_next_step()
             return
 
@@ -409,8 +398,6 @@ class SignFollower(Node):
             self._cooldown_until = (
                 time.monotonic() + self._post_turn_cooldown_s
             )
-            self._stable_count = 0
-            self._pending_sign = None
         self._send_drive_goal()
 
     def _cancel_goal(self) -> None:

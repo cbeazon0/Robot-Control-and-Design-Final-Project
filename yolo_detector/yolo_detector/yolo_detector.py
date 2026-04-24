@@ -1,27 +1,3 @@
-"""YOLO detector node.
-
-Reads frames from ``/dev/video0``, runs the red/quad preprocessing pipeline
-(copied from the user's offline script), feeds the preprocessed frame into a
-YOLO model loaded from a ``best.pt`` weights file, and logs each detection's
-class name and confidence. Nothing is ever written to disk.
-
-Dependencies (install with pip if missing):
-
-    pip install ultralytics opencv-python scikit-learn numpy
-
-Run with:
-
-    ros2 run yolo_detector yolo_detector
-
-Parameters (all optional):
-
-    weights_path    : absolute path to the .pt file. If empty, the node
-                      searches parent directories for 'best.pt'.
-    camera_device   : OpenCV-compatible device (default '/dev/video0').
-    detect_rate_hz  : how often to grab a frame and run inference.
-    min_confidence  : drop detections below this score.
-"""
-
 from __future__ import annotations
 
 import json
@@ -33,16 +9,9 @@ import rclpy
 from rclpy.node import Node
 from sklearn.cluster import DBSCAN
 from std_msgs.msg import String
+from ultralytics import YOLO
 
-try:
-    from ultralytics import YOLO
-except ImportError as exc:  # pragma: no cover - surfaced at runtime
-    raise SystemExit(
-        "ultralytics is not installed. Install with: pip install ultralytics"
-    ) from exc
-
-
-# Preprocessing parameters (match the user's offline script).
+# tuned on our calibration frames
 MIN_BLOB_AREA = 200
 EPS_PIXELS = 50
 MORPH_KERNEL = (5, 5)
@@ -50,13 +19,10 @@ PAD = 20
 DARK_THRESH = 60
 MIN_DARK_CONTOUR_AREA = 200
 
+DETECT_RATE_HZ = 1.0
 
-def preprocess_frame(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Return (boosted BGR image, binary final_mask).
 
-    Keeps only red pixels that lie inside a dark quadrilateral, then pushes
-    those pixels toward saturated red. Non-kept pixels are black.
-    """
+def preprocess_frame(img: np.ndarray) -> np.ndarray:
     h, w = img.shape[:2]
 
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
@@ -79,7 +45,6 @@ def preprocess_frame(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     )
 
     points: list[list[float]] = []
-    valid_contours: list[np.ndarray] = []
     bboxes: list[tuple[int, int, int, int]] = []
 
     for c in contours:
@@ -92,7 +57,6 @@ def preprocess_frame(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         cy = m['m01'] / m['m00']
         x, y, bw_w, bw_h = cv2.boundingRect(c)
         points.append([cx, cy])
-        valid_contours.append(c)
         bboxes.append((x, y, bw_w, bw_h))
 
     red_clusters: dict[int, list] = {}
@@ -102,13 +66,11 @@ def preprocess_frame(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         pts = np.array(points)
         labels = DBSCAN(eps=EPS_PIXELS, min_samples=1).fit(pts).labels_
         for i, lbl in enumerate(labels):
-            red_clusters.setdefault(int(lbl), []).append(
-                (valid_contours[i], points[i], bboxes[i])
-            )
+            red_clusters.setdefault(int(lbl), []).append(bboxes[i])
 
     for lbl, members in red_clusters.items():
         xs, ys, x2s, y2s = [], [], [], []
-        for _, _, bb in members:
+        for bb in members:
             x, y, bw_w, bw_h = bb
             xs.append(x)
             ys.append(y)
@@ -122,6 +84,7 @@ def preprocess_frame(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
     quad_mask_global = np.zeros((h, w), dtype=np.uint8)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    k_roi = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
 
     for _lbl, (x_min, y_min, gw, gh) in cluster_bboxes.items():
         roi_gray = gray[y_min:y_min + gh, x_min:x_min + gw]
@@ -130,11 +93,10 @@ def preprocess_frame(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         _, dark_mask = cv2.threshold(
             roi_gray, DARK_THRESH, 255, cv2.THRESH_BINARY_INV
         )
-        k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, k)
-        dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, k)
+        dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, k_roi)
+        dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, k_roi)
 
-        red_dil = cv2.dilate(roi_mask_red, k, iterations=10)
+        red_dil = cv2.dilate(roi_mask_red, k_roi, iterations=10)
         focused_dark = cv2.bitwise_and(dark_mask, cv2.bitwise_not(red_dil))
 
         d_cnts, _ = cv2.findContours(
@@ -175,46 +137,26 @@ def preprocess_frame(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             cv2.drawContours(quad_mask_global, [best_quad_global], -1, 255, -1)
 
     final_mask = cv2.bitwise_and(mask_red, quad_mask_global)
-    result = cv2.bitwise_and(img, img, mask=final_mask)
 
-    # Natural red boost: pump R, suppress G and B, then re-mask to avoid leak.
-    b, g, r = cv2.split(result)
+    # cranked red channel so the network sees the same thing we trained on
+    b, g, r = cv2.split(cv2.bitwise_and(img, img, mask=final_mask))
     r = cv2.add(r, 100)
     g = cv2.multiply(g, 0.5)
     b = cv2.multiply(b, 0.5)
     result_boost = cv2.merge([b, g, r])
     result_boost = cv2.bitwise_and(result_boost, result_boost, mask=final_mask)
 
-    return result_boost, final_mask
-
-
-def _find_default_weights() -> str:
-    """Walk up from this file looking for 'best.pt'."""
-    here = os.path.abspath(os.path.dirname(__file__))
-    probe = here
-    for _ in range(8):
-        probe = os.path.dirname(probe)
-        if not probe or probe == '/':
-            break
-        cand = os.path.join(probe, 'best.pt')
-        if os.path.isfile(cand):
-            return cand
-    return os.path.join(os.getcwd(), 'best.pt')
+    return result_boost
 
 
 class YoloDetectorNode(Node):
-    """Grab frames, preprocess, run YOLO, log detections."""
-
     def __init__(self) -> None:
         super().__init__('yolo_detector')
 
         self.declare_parameter('weights_path', '')
         self.declare_parameter('camera_device', '/dev/video0')
-        self.declare_parameter('detect_rate_hz', 5.0)
         self.declare_parameter('min_confidence', 0.25)
-        # Collapse directional variants into canonical class names. Each
-        # entry is "<raw_class_name>=<canonical_class_name>". The '='
-        # separator is safe for class names that contain ':' or spaces.
+        # label.train names -> what the follower code expects, 'left=turn' style
         self.declare_parameter(
             'class_aliases',
             [
@@ -231,9 +173,6 @@ class YoloDetectorNode(Node):
         self._camera_device = (
             self.get_parameter('camera_device').get_parameter_value().string_value
         )
-        rate_hz = (
-            self.get_parameter('detect_rate_hz').get_parameter_value().double_value
-        )
         self._min_conf = (
             self.get_parameter('min_confidence').get_parameter_value().double_value
         )
@@ -246,10 +185,6 @@ class YoloDetectorNode(Node):
         self._class_aliases: dict[str, str] = {}
         for entry in raw_aliases:
             if '=' not in entry:
-                self.get_logger().warn(
-                    f"Ignoring class_aliases entry '{entry}' "
-                    "(expected '<raw>=<canonical>')."
-                )
                 continue
             raw, canonical = entry.split('=', 1)
             raw = raw.strip()
@@ -258,30 +193,29 @@ class YoloDetectorNode(Node):
                 continue
             self._class_aliases[raw] = canonical
         if self._class_aliases:
-            self.get_logger().info(
-                f"Class aliases active: {self._class_aliases}"
-            )
+            self.get_logger().info('aliases: %r' % (self._class_aliases,))
 
         if not weights_path:
-            weights_path = _find_default_weights()
+            wdir = os.path.abspath(os.path.dirname(__file__))
+            got = None
+            for _ in range(8):
+                wdir = os.path.dirname(wdir)
+                if not wdir or wdir == '/':
+                    break
+                cand = os.path.join(wdir, 'best.pt')
+                if os.path.isfile(cand):
+                    got = cand
+                    break
+            weights_path = got or os.path.join(os.getcwd(), 'best.pt')
 
         if not os.path.isfile(weights_path):
-            raise FileNotFoundError(
-                f"YOLO weights not found at '{weights_path}'. "
-                "Set the 'weights_path' parameter or place best.pt under "
-                "your workspace's src/ directory."
-            )
+            raise FileNotFoundError('no weights at %r (pass weights_path?)' % (weights_path,))
 
         self.get_logger().info(f"Loading YOLO weights from '{weights_path}'.")
         self._model = YOLO(weights_path)
 
-        # Prefer opening the V4L2 device by path with an explicit V4L2
-        # backend. On systems with many /dev/video* nodes (e.g. Raspberry
-        # Pi, which exposes bcm2835-codec and bcm2835-isp devices), using
-        # a numeric index makes OpenCV probe every node and often lands
-        # on a non-capture device, failing with "Not a video capture
-        # device." Opening by path with CAP_V4L2 avoids that.
-        attempts: list[tuple[object, int, str]] = []
+        # pi + laptop cams: open /dev/videoN by path + V4L2 first, indices are flaky
+        attempts = []  # (opencv_source, backend, tag for log)
         if self._camera_device.startswith('/dev/video'):
             attempts.append((self._camera_device, cv2.CAP_V4L2, 'path+V4L2'))
             attempts.append((self._camera_device, cv2.CAP_ANY, 'path+ANY'))
@@ -296,10 +230,7 @@ class YoloDetectorNode(Node):
         self._cap = None
         last_source = None
         for source, backend, label in attempts:
-            self.get_logger().info(
-                f"Opening camera '{self._camera_device}' "
-                f"(cv2 source={source!r}, backend={label})."
-            )
+            self.get_logger().info("cam try %r %s" % (source, label))
             cap = cv2.VideoCapture(source, backend)
             if cap.isOpened():
                 self._cap = cap
@@ -307,27 +238,19 @@ class YoloDetectorNode(Node):
                 break
             cap.release()
 
-        if self._cap is None or not self._cap.isOpened():
+        if self._cap is None:
             raise RuntimeError(
-                f"Could not open camera '{self._camera_device}'. "
-                "Check that the device exists, that no other process is "
-                "holding it, and that your user is in the 'video' group "
-                "(run `groups` to verify; add with "
-                "`sudo usermod -aG video $USER` then log out/in)."
+                "opencv would not open %r (in use, wrong /dev, or not in `video` group?)"
+                % (self._camera_device,)
             )
-        self.get_logger().info(
-            f"Camera opened via source={last_source!r}."
-        )
+        self.get_logger().info('cam ok, source %r' % (last_source,))
 
         self._pub = self.create_publisher(String, 'yolo_detections', 10)
 
-        period = 1.0 / max(rate_hz, 0.1)
+        period = 1.0 / max(DETECT_RATE_HZ, 0.1)
         self._timer = self.create_timer(period, self._on_tick)
 
-        self.get_logger().info(
-            f"yolo_detector ready: rate={rate_hz:.1f} Hz, "
-            f"min_confidence={self._min_conf:.2f}."
-        )
+        self.get_logger().info('spinning @ %.1fHz thr=%.2f' % (DETECT_RATE_HZ, self._min_conf))
 
     def _on_tick(self) -> None:
         ok, frame = self._cap.read()
@@ -336,9 +259,9 @@ class YoloDetectorNode(Node):
             return
 
         try:
-            processed, _ = preprocess_frame(frame)
-        except Exception as exc:  # noqa: BLE001 - don't let one bad frame kill the node
-            self.get_logger().error(f'Preprocessing failed: {exc}')
+            processed = preprocess_frame(frame)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error('preprocess: %s' % (exc,))
             return
 
         img_h, img_w = processed.shape[:2]
@@ -365,10 +288,6 @@ class YoloDetectorNode(Node):
                 ) else str(cls_id)
                 cls_name = self._class_aliases.get(raw_cls_name, raw_cls_name)
 
-                # xyxy is (x1, y1, x2, y2) in the processed-frame coordinate
-                # system. Processed frame is the same size as the raw frame
-                # (preprocess does not resize), so these pixels map 1:1 to
-                # raw camera pixels.
                 x1, y1, x2, y2 = (
                     float(v.item()) for v in boxes.xyxy[i]
                 )
@@ -380,8 +299,8 @@ class YoloDetectorNode(Node):
                 aliased = cls_name != raw_cls_name
                 alias_hint = f" [raw='{raw_cls_name}']" if aliased else ''
                 self.get_logger().info(
-                    f"Detected '{cls_name}'{alias_hint} (conf={conf:.3f}) "
-                    f"bbox=[{bw:.0f}x{bh:.0f}] @ ({cx:.0f},{cy:.0f})"
+                    "det %s%s conf=%.2f box %.0f %.0f center %.0f %.0f"
+                    % (cls_name, alias_hint, conf, bw, bh, cx, cy)
                 )
 
                 payload = {
@@ -397,7 +316,7 @@ class YoloDetectorNode(Node):
                     'img_h': int(img_h),
                 }
                 msg = String()
-                msg.data = json.dumps(payload, separators=(',', ':'))
+                msg.data = json.dumps(payload)
                 self._pub.publish(msg)
 
     def destroy_node(self) -> bool:
@@ -420,7 +339,6 @@ def main(args=None) -> None:
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()
